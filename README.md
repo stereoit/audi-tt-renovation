@@ -21,12 +21,13 @@ A technical reference, bench wiring guide, and EEPROM decoding toolkit for the e
   - [5.4 kw1281test (CLI Tool for Marelli Dumps)](#54-kw1281test-cli-tool-for-marelli-dumps)
   - [5.5 MPPS & ME7 Tools (Engine ECU Integration)](#55-mpps--me7-tools-engine-ecu-integration)
 - [6. EEPROM Memory Architecture & Decoding Reference](#6-eeprom-memory-architecture--decoding-reference)
-  - [6.1 Dump Overview (`TT_919_orig_252622km.bin`)](#61-dump-overview-tt_919_orig_252622kmbin)
+  - [6.1 What the 64 KB "direct read" actually contains](#61-what-the-64-kb-direct-read-actually-contains)
   - [6.2 Odometer (Mileage) Decoding](#62-odometer-mileage-decoding)
-  - [6.3 Immobilizer PIN / SKC (Secret Key Code)](#63-immobilizer-pin--skc-secret-key-code)
-  - [6.4 Transponder Key Data & Immobilizer Status](#64-transponder-key-data--immobilizer-status)
+  - [6.3 Immobiliser PIN / SKC](#63-immobiliser-pin--skc-unverified)
+  - [6.4 Transponder Key Data](#64-transponder-key-data)
 - [7. Common Failure Modes of Jaeger M73 Clusters](#7-common-failure-modes-of-jaeger-m73-clusters)
-- [8. Dump Inspection Helper Script](#8-dump-inspection-helper-script)
+- [8. Dump Tooling (`tools/eeprom_tool.py`)](#8-dump-tooling-toolseeprom_toolpy)
+- [9. Using the 920 (CAN / Immo 3) Cluster in the Early 919 Car](#9-using-the-920-can--immo-3-cluster-in-the-early-919-car)
 
 ---
 
@@ -302,103 +303,116 @@ The 225HP TT uses a **Bosch ME7.5** engine ECU (e.g., `06A 906 032 AR / HJ` for 
 
 ## 6. EEPROM Memory Architecture & Decoding Reference
 
-### 6.1 Dump Overview (`TT_919_orig_252622km.bin`)
+Everything in this section was verified against **both** dumps in `EEPROM/` with
+`tools/eeprom_tool.py` (see section 8). Items marked *unverified* are plausible
+interpretations that have not been confirmed against a diagnostic tool.
 
-Located in `EEPROM/TT_919_orig_252622km.bin`:
+### 6.1 What the 64 KB "direct read" actually contains
 
-- **File size**: `65,536` bytes (64 KB).
-- **Active memory areas**:
-  - `0x0000 - 0x3C00`: Microcontroller working registers, static configuration, odometer mirrors, and crypto buffers.
-  - `0x3800 - 0x3B50`: Internal EEPROM non-volatile data (cluster part number, VIN, transponders, PIN).
-  - `0x8000 - 0x10000`: Microcontroller internal operating firmware and diagnostic lookup tables.
+The 64 KB file is a dump of the whole 68HC912DG128 CPU address space as seen by the
+bootstrap routine that VAG K+CAN Commander uploads. Only a small part of it is
+non-volatile data you can meaningfully write back:
 
-#### Identification Strings in the Dump
+| CPU address | Size | Content | Persistent? |
+| :--- | :--- | :--- | :--- |
+| `0x0000 – 0x37FF` | 14 KB | RAM / working memory. The first 50 bytes are identical in both dumps (the tool's loader code). Contains live copies of odometer, key data, PIN etc. that the firmware rebuilds from EEPROM at power-up. | **No** (volatile) |
+| `0x3800 – 0x3FFF` | **2 KB** | **Internal EEPROM** – part number, odometer ring buffer, immobiliser data, keys, VIN (920). This is what `kw1281test DumpMarelliMem 14336 2048` reads. | **Yes** |
+| `0x4000 – 0xFFFF` | 48 KB | Internal flash – firmware (`V7.66ML` on the 919, `V8.51ML` on the 920), reset vector at `0xFFFE`. The 919 has `0x4000–0x7FFF` erased. | Yes, but not something to edit |
+
+Consequences:
+
+- The "static mileage registers" at `0x0080` (919) are RAM. On the 920 firmware the same
+  live copy sits at `0x0F1A`. They are not inputs, they are outputs of the firmware.
+- The only thing worth editing / writing back is `0x3800–0x3FFF`. Use
+  `eeprom_tool.py extract` to get a 2 KB EEPROM-only image, and `inject` to put a 2 KB
+  image back into a 64 KB file if your writing tool insists on the 64 KB format.
+  The tool accepts both formats everywhere and always talks in CPU addresses.
+- **No checksum was found.** A brute-force search for 8/16-bit sum, negated sum, XOR
+  and common CRC-8/CRC-16 values adjacent to any 3–128 byte range, required to hold
+  in both dumps, produced zero hits outside the odometer ring (where every hit is an
+  artefact of the complement pairs). Integrity is instead provided by redundancy:
+  the odometer ring has a bitwise-inverted twin, and the key block is stored three
+  times. `eeprom_tool.py verify` checks these invariants.
+
+#### Identification strings
 
 ```text
-Offset 0x3A29:  8N1919860C  D29
-Offset 0xC003:  V7.66ML   EP_2002
-Offset 0xC463:  KOMBI+WEGFAHRS. M73
-Offset 0xC47C:  Ident.-Nr. Wegfahrs.: AUZ5Z0...
-Offset 0x384A:  ZAJUK3CD011
+                    919 (TT_919_orig_252622km.bin)     920 (GB_920_dump.bin)
+0x3A29 part number  8N1919860C  D29                    8N2920950A  D04
+0x384A serial-like  ZAJUK3CD011                        RALMLL5C003
+0x3B4E/89/C4 immo   (none in EEPROM)                   AUZ5Z0B3245205  (x3)
+0x3BFD VIN slot     (0xFF)                             XXXXXXXXXXXXXXXXX (placeholder)
+0x3C18 VIN slot     (0xFF)                             TRUZZZ8N8xxxxxxxx (donor car's VIN)
+0xC003 firmware     V7.66ML   EP_2002                  V8.51ML   EP_2002   [flash]
 ```
+
+`8N2` = right-hand-drive part number (UK donor). `D29`/`D04` is the data-set index shown by VCDS.
 
 ---
 
 ### 6.2 Odometer (Mileage) Decoding
 
-In the Magneti Marelli / Jaeger MC68HC912 architecture, mileage is recorded using a combination of **static summary registers** and a **rolling ring buffer** that prevents EEPROM flash wear.
-
-#### Static Mileage Registers
-
-The mileage is stored in **hexadecimal kilometers**:
-
-$$\text{252,622 km} \longrightarrow \mathbf{0x03DACE}$$
+The odometer is a **36-entry ring buffer of 4-byte big-endian kilometre values** advanced
+every 2 km, stored twice:
 
 ```text
-Offset 0x0080:  85 00 03 DA CE 00 03 DA CE 00 00 00 A0 00 00 00
-                      └────────┘  └────────┘
-                     252,622 km  252,622 km (Redundant copy)
+0x3899 – 0x3928   36 x 4 bytes   bitwise NOT of the plain ring (integrity twin)
+0x3929 – 0x39B8   36 x 4 bytes   plain ring, big-endian km
 ```
 
-Directly preceding the kilometer value is the mileage stored in **miles**:
+(The previous version of this document listed `0x3928`; the plain ring starts at
+`0x3929`, the byte at `0x3928` is the last byte of the inverted twin.)
 
-$$\text{252,622 km} \div 1.609344 = 156,972.1 \text{ miles} \approx 156,973 \text{ miles} \longrightarrow \mathbf{0x02654D}$$
+Current mileage = the largest entry. The entry after it (circularly) is the oldest.
 
 ```text
-Offset 0x007C:  02 65 4D
-                └──────┘
-              156,973 miles
+919:  newest at index 11 (0x3955): 00 03 DA CE = 252,622 km ; oldest 252,552 km ; all even
+920:  newest at index  6 (0x3941): 00 03 8E 47 = 233,031 km ; oldest 232,961 km ; all odd
 ```
 
-#### Rolling Ring Buffer (Wear-Leveling Odometer)
+Both parities occur in real clusters, so the firmware does not appear to care about it.
+Immediately before the ring there is a 5-byte field (`0x3894`: `03 8E FF FF FF` / `03 6E FF 00 64`)
+of unknown purpose; `set-odometer` leaves it alone. If a rewritten cluster misbehaves,
+this is the first place to look.
 
-From offset `0x3928` to `0x39B7`, the cluster maintains a 36-entry circular log updating every 2 kilometers:
-
-```text
-Offset 0x3928:  00 03 DA B8  (252,600 km)
-Offset 0x392C:  00 03 DA BA  (252,602 km)
-Offset 0x3930:  00 03 DA BC  (252,604 km)
-Offset 0x3934:  00 03 DA BE  (252,606 km)
-Offset 0x3938:  00 03 DA C0  (252,608 km)
-...
-Offset 0x3954:  00 03 DA CE  (252,622 km) ◄── LATEST LOG ENTRY
-Offset 0x3958:  00 03 DA 88  (252,552 km) ◄── Previous cycle wrap-around
-```
+The 920 is a UK (`8N2`, MPH) cluster, yet its ring is in kilometres (233,031 km ≈ 144,799 mi);
+the miles value in RAM (`0x0F1E`: `00 02 35 BD` = 144,829) is derived by the firmware.
 
 ---
 
-### 6.3 Immobilizer PIN / SKC (Secret Key Code)
-
-The Secret Key Code (SKC) is stored in the EEPROM block immediately preceding the key-count sequence marker `00 [keys] 0F`:
+### 6.3 Immobiliser PIN / SKC (*unverified*)
 
 ```text
-Offsets 0x03ED and 0x3881:
-03 2B 00 02 0F 05
-└─┬─┘ └──┬──┘
-  │      └── Marker: 2 keys adapted (0x02)
-  └───────── PIN Code: 0x032B
+919  0x3880:  ff 03 2b 00 02 0f 05 ff 00 00 03 0a ff ff ff ff
+920  0x3880:  ff ff 02 1e 00 ff 00 00 00 00 00 00 ff ff ff ff
 ```
 
-- **Big-Endian representation**: `0x032B` = `811` $\rightarrow$ **VCDS PIN: `00811`**
-- **Byte-swapped (Little-Endian) representation**: `0x2B03` = `11011`
-
-*Note: For VCDS login, always pad to 5 digits (e.g. `00811`).*
+Reading `0x3881–0x3882` as a big-endian PIN gives **00811** for the 919, with `0x3884 = 02`
+matching the two keys stored in the key block. On the 920 the same pattern appears shifted by
+one byte (`0x3882`: `02 1E` → **00542**). Neither value has been confirmed against what
+VAG Commander / VCDS report, so treat them as candidates. `03 0A` appears in both dumps
+(919 `0x388A`, 920 `0x3AB9`) and is probably a constant, not part of the PIN.
 
 ---
 
-### 6.4 Transponder Key Data & Immobilizer Status
+### 6.4 Transponder Key Data
 
-The cluster uses **Megamos Crypto 48 (ID48)** transponder chips.
-
-In `0x3A39–0x3A9F`, the cluster stores 3 identical redundant 16-byte cryptographically adapted key blocks:
+Key data is stored three times. The copies are byte-identical in both dumps.
 
 ```text
-Block 1 (0x3A39):  02 BC 13 31 3A 5B 79 99 B4 D4 29 BD AD FC A9 42
-Block 2 (0x3A62):  02 13 31 3A 5B 79 99 B4 D4 29 BD AD FC A9 42 41
-Block 3 (0x3A8B):  02 13 31 3A 5B 79 99 B4 D4 29 BD AD FC A9 42 41
+919 (Immo 2): 16 bytes at 0x3A3A, 0x3A63, 0x3A8C (stride 41)
+   [02 bc] 13 31 3a 5b 79 99 b4 d4 | 29 bd ad fc a9 42 41 43
+            key 1 (8 bytes)          key 2 (8 bytes)
+   RAM 0x02EB holds key 1 byte-reversed. The byte before copies 2/3 is 02 (key count?).
+
+920 (Immo 3): 35 bytes at 0x3B4B, 0x3B86, 0x3BC1 (stride 59)
+   02 | 0c 9c | "AUZ5Z0B3245205" | 12 20 3c 5b 7c 95 b0 20 00 00 | 5b ca 0a 8a | 5b ca 0e f6
+   cnt   ?      immobiliser ID      ?                              key 1 ID?     key 2 ID?
 ```
 
-The mirror data at `0x02EB` contains the byte-inverted key sequence `D4 B4 99 79 5B 3A 31 13`.
+The 920 additionally stores the donor vehicle's 17-character VIN at `0x3C18` and a
+`XXXXXXXXXXXXXXXXX` placeholder at `0x3BFD`. Immo 3 compares cluster and ECU identity, so
+these matter if the cluster is ever paired with an Immo 3 ECU (`eeprom_tool.py set-vin`).
 
 ---
 
@@ -420,54 +434,72 @@ The Magneti Marelli / Jaeger clusters in early Audi TTs are notorious for severa
 
 ---
 
-## 8. Dump Inspection Helper Script
+## 8. Dump Tooling (`tools/eeprom_tool.py`)
 
-To inspect, decode, and verify any bin dump from this cluster, run the following Python script from the repository root:
+A dependency-free Python 3 CLI that understands both the 64 KB direct-read format and the
+2 KB EEPROM-only format. All addresses are CPU addresses (EEPROM = `0x3800–0x3FFF`).
 
-```python
-#!/usr/bin/env python3
-"""
-Audi TT 8N Jaeger Cluster (8N1919860C) Dump Inspector
-"""
-import sys
-from pathlib import Path
-
-def inspect_dump(bin_path: str):
-    data = Path(bin_path).read_bytes()
-    print(f"=== Inspecting: {bin_path} ===")
-    print(f"File Size: {len(data)} bytes ({len(data)//1024} KB)\n")
-
-    # Part Number
-    pn = data[0x3A29:0x3A3B].decode('ascii', errors='replace').strip()
-    print(f"Part Number / Software : {pn}")
-
-    # Mileage
-    km = int.from_bytes(data[0x0082:0x0085], 'big')
-    miles = int.from_bytes(data[0x007C:0x007F], 'big')
-    print(f"Odometer Reading (KM)  : {km:,} km (Hex: {km:06X})")
-    print(f"Odometer Reading (MI)  : {miles:,} mi (Hex: {miles:06X})")
-
-    # PIN / SKC
-    pin_be = (data[0x3881] << 8) | data[0x3882]
-    pin_le = (data[0x3882] << 8) | data[0x3881]
-    keys = data[0x3884]
-    print(f"Adapted Keys           : {keys}")
-    print(f"Immo PIN (Big-Endian)  : {pin_be:05d} (0x{pin_be:04X})")
-    print(f"Immo PIN (Little-End)  : {pin_le:05d} (0x{pin_le:04X})")
-
-if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "EEPROM/TT_919_orig_252622km.bin"
-    inspect_dump(path)
-```
-
-Run with:
 ```bash
-python3 -c "
-from pathlib import Path
-data = Path('EEPROM/TT_919_orig_252622km.bin').read_bytes()
-km = int.from_bytes(data[0x0082:0x0085], 'big')
-pin = (data[0x3881] << 8) | data[0x3882]
-print(f'Part: {data[0x3A29:0x3A3B].decode(errors=\"ignore\").strip()}')
-print(f'KM: {km:,} km | PIN: {pin:05d}')
-"
+# decode a dump (part number, odometer ring, immo/key/VIN data, unknown fields)
+python3 tools/eeprom_tool.py info EEPROM/TT_919_orig_252622km.bin
+python3 tools/eeprom_tool.py info EEPROM/GB_920_dump.bin
+
+# structural sanity check (ring complement, 36-step sequence, key copies, reset vector)
+python3 tools/eeprom_tool.py verify EEPROM/GB_920_dump.bin
+
+# 64 KB -> 2 KB EEPROM image, and back into a 64 KB template
+python3 tools/eeprom_tool.py extract EEPROM/GB_920_dump.bin 920_eeprom.bin
+python3 tools/eeprom_tool.py inject  EEPROM/GB_920_dump.bin 920_eeprom.bin 920_full.bin
+
+# compare dumps (any mix of 64 KB / 2 KB); read the cluster twice and diff to see what is volatile
+python3 tools/eeprom_tool.py diff EEPROM/TT_919_orig_252622km.bin EEPROM/GB_920_dump.bin --eeprom-only
+
+# carry the car's real mileage from the old cluster into the new one
+python3 tools/eeprom_tool.py set-odometer EEPROM/GB_920_dump.bin --out 920_252622km.bin \
+        --from-dump EEPROM/TT_919_orig_252622km.bin
+#   ... or an explicit value; --match-parity keeps the cluster's existing odd/even ring parity
+python3 tools/eeprom_tool.py set-odometer 920_eeprom.bin --out out.bin --km 252622 --match-parity
+
+# write the car's VIN into the 920 VIN slots
+python3 tools/eeprom_tool.py set-vin 920_252622km.bin --out 920_final.bin --vin TRUZZZ8N...
+
+# low level
+python3 tools/eeprom_tool.py hexdump EEPROM/GB_920_dump.bin --start 0x3880 --end 0x3A00
+python3 tools/eeprom_tool.py strings EEPROM/GB_920_dump.bin
+python3 tools/eeprom_tool.py set-bytes in.bin --out out.bin --at 0x3881 --hex "03 2b"
+python3 tools/eeprom_tool.py checksum-scan EEPROM/TT_919_orig_252622km.bin EEPROM/GB_920_dump.bin
+
+# regression tests against the dumps in EEPROM/
+python3 -m unittest tools/test_eeprom_tool.py -v
 ```
+
+`set-odometer` rewrites exactly 144 bytes (`0x3899–0x39B8`), keeps the ring pointer
+(newest-entry index) where the cluster had it, regenerates the inverted twin, and refuses to
+overwrite its input. `set-*` commands never touch RAM or flash.
+
+---
+
+## 9. Using the 920 (CAN / Immo 3) Cluster in the Early 919 Car
+
+What the dumps tell us, and what they do not:
+
+1. **Mileage** – transferable with `set-odometer` (section 8). This is the legitimate
+   case of making a replacement cluster show the vehicle's true mileage; keep the
+   original dump as evidence.
+2. **Immobiliser generation mismatch** – the 919 car has an Immo 2 ECU that talks to the
+   cluster over the W-line (green pin 5). The 920 cluster is Immo 3 and authorises the ECU over
+   CAN. They cannot be matched to each other. Practical options:
+   - flash the ME7.5 ECU immo-off (MPPS / ME7 EEPROM tools, section 5.5). The cluster's
+     immobiliser lamp will keep flashing because it never sees a matching ECU, but the
+     engine runs; or
+   - fit an Immo 3 ECU and adapt it to the 920 cluster (needs the 920 PIN and the car's VIN
+     in the cluster, `set-vin`).
+   The donor's keys (`5b ca 0a 8a`, `5b ca 0e f6`) are in the 920 EEPROM; your own keys would
+   need adapting via VCDS adaptation channel 21 with the 920's PIN.
+3. **Wiring** – the 919 harness has nothing on green pins 18/19. Run a twisted pair from the
+   ME7.5 powertrain CAN (CAN-H / CAN-L at the ECU or the ABS unit) to green pins 18/19.
+   RPM, coolant temperature and consumption then arrive over CAN instead of blue pins 11/8/25.
+   Whether the early APX ME7.5 software broadcasts the cluster-relevant frames is not
+   verifiable from these dumps – test on the bench with the ECU before cutting the harness.
+4. **Units / coding** – `8N2920950A` is an RHD MPH dial. Country/units are part of the
+   cluster coding (VCDS, 17-Instruments, function 07), not the EEPROM fields documented here.
