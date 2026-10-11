@@ -28,6 +28,12 @@ A technical reference, bench wiring guide, and EEPROM decoding toolkit for the e
 - [7. Common Failure Modes of Jaeger M73 Clusters](#7-common-failure-modes-of-jaeger-m73-clusters)
 - [8. Dump Tooling (`tools/eeprom_tool.py`)](#8-dump-tooling-toolseeprom_toolpy)
 - [9. Using the 920 (CAN / Immo 3) Cluster in the Early 919 Car](#9-using-the-920-can--immo-3-cluster-in-the-early-919-car)
+- [10. ME7.5 Engine ECU Flash (`ECU/`)](#10-me75-engine-ecu-flash-ecu)
+  - [10.1 The three files](#101-the-three-files)
+  - [10.2 Flash layout and checksum structure](#102-flash-layout-and-checksum-structure)
+  - [10.3 What the "SAI off" modification is](#103-what-the-sai-off-modification-is)
+  - [10.4 Plan for the final firmware](#104-plan-for-the-final-firmware)
+- [11. Flash Tooling (`tools/me7_tool.py`)](#11-flash-tooling-toolsme7_toolpy)
 
 ---
 
@@ -503,3 +509,166 @@ What the dumps tell us, and what they do not:
    verifiable from these dumps – test on the bench with the ECU before cutting the harness.
 4. **Units / coding** – `8N2920950A` is an RHD MPH dial. Country/units are part of the
    cluster coding (VCDS, 17-Instruments, function 07), not the EEPROM fields documented here.
+
+---
+
+## 10. ME7.5 Engine ECU Flash (`ECU/`)
+
+Engine ECU of the car: Bosch ME7.5, VAG part `8N0906018AE`, software `0001`, Bosch
+`0261207030` / `1037354178`, EPK `36/1/ME7.5/5/4018.10//F19w2/Dst01o//`, engine
+`1.8L R4/5VT` (APX 225 HP). The flash is a 512 KB AM29F400 image; the C167 CPU sees it at
+`0x800000`–`0x87FFFF`. All offsets below are **file offsets** (subtract `0x800000` from
+any C167 address you see in other tools).
+
+### 10.1 The three files
+
+| File | MD5 | Content |
+|---|---|---|
+| `8N0906018AE 0001.Bin` | `7602ca25…1361` | original read of the car's ECU, all 43 checksums valid |
+| `8N0906018AE_0001_MOD_XTUNER_SAIOFF_done.Bin` | `f0cabb1d…34af` | original + 2 data bytes changed + 20 checksum bytes corrected |
+| `8N0906018AE_dyno-chiptunning.stage1.Bin` | `f0cabb1d…34af` | **byte-identical to the SAI-off file** |
+
+So the file saved under the "stage1" name is *not* a stage 1 tune – it is the same SAI-off
+file again (`cmp` reports no difference). The dyno-chiptuningfiles answer ("soft tuning
+inside, only a few maps changed, no SAI off inside") therefore describes a file that is not
+in this directory. Their remark "only a few maps changed" is also what one expects when they
+look at the *SAI-off* file (2 bytes changed) – it is possible they diffed that upload against
+their own stock and simply reported on it. When the real stage 1 arrives, drop it into
+`ECU/` and run `tools/me7_tool.py diff` against the original; every non-checksum run it
+reports is a tuned map.
+
+Their other two remarks are correct and matter for the final firmware:
+
+* **"Immo is in the eeprom, we can't see that."** – On ME7.5 the immobiliser state lives in
+  the 95040 SPI EEPROM on the ECU board, not in the 512 KB flash. Immo-off is therefore an
+  *EEPROM* edit (ME7EEPROM / Galletto / MPPS EEPROM read + patch), independent of whatever
+  flash file is used. None of the three flash files touches it, and no flash-only service can
+  deliver it.
+* **"No SAI off inside."** – consistent with the file analysis: a tuning house that starts
+  from a stock file will not carry the XTuner bits across. The SAI-off change has to be
+  re-applied on top of whatever stage 1 file is delivered (see 10.4).
+
+### 10.2 Flash layout and checksum structure
+
+```
+0x00000-0x0FFFF   boot loader / ROMSYS header @0x08000
+0x10000-0x1FFFF   calibration: maps, curves, scalar parameters, ID strings
+                   0x1432A EPK, 0x144D5 Bosch HW/SW numbers, 0x15317 VAG part number
+                   0x1FC00-0x1FE1F multipoint checksum table (34 x 16-byte descriptors)
+0x20000-0x7FFFF   program code; main program checksum pair @0x7FFE0
+```
+
+The ECU validates the image with five independent mechanisms. All of them are found and
+recomputed by `me7_tool.py`, and the result was verified byte-for-byte against
+[ME7Sum](https://github.com/nyetwurk/ME7Sum) (the open-source reference checker):
+
+| Mechanism | Covers | Stored at | Algorithm |
+|---|---|---|---|
+| ROMSYS startup / param-page / program-pages | a few words each | `0x08038`, `0x1A8AE`, `0x0803C` | 16-bit word sums |
+| Main data CRC32, zone 1/2/3 | `0x10000-0x13FFF`, `0x14300-0x17F67`, `0x18191-0x1FBFF` | `0x67058`, `0x6705E`, `0x67064` | standard CRC-32 |
+| Background checksums | `0x24000-0x26567`, `0x14000-0x14243` | `0x1422C`, `0x1423C` (+inverse) | 16-bit word sum |
+| Main program checksum | `0x00000-0x0FBFF` + `0x20000-0x7FFFF` | `0x7FFE0` (+inverse) | 16-bit word sum |
+| Multipoint (34 blocks of 16 KB) | whole flash | `0x1FC00` table, value+inverse each | 16-bit word sum |
+
+A calibration change therefore always ripples into: one multipoint block, one CRC32 zone,
+and (because the multipoint table itself is inside block 10 and the CRC values are inside
+block 28 of the program area) one or two further multipoint blocks plus the main program
+checksum. Three calibration windows (`0x14000-0x142FF`, `0x17F68-0x18190`, `0x1FC00-0x1FFFF`)
+are not covered by any CRC32 zone, only by multipoint sums.
+
+### 10.3 What the "SAI off" modification is
+
+`me7_tool.py diff` of original vs. XTuner file:
+
+```
+0x14EE9-0x14EEA [2] calibration          f8 33 -> fb 3f
+0x1FC78.. 0x1FC7D   checksum: multipoint 8   (block 0x14000-0x17F67)
+0x1FDB8.. 0x1FDBE   checksum: multipoint 28  (block 0x64000-0x67FFF, holds the CRC values)
+0x6705E-0x67061     checksum: CRC32 zone 2
+0x7FFE0-0x7FFE6     checksum: main program checksum
+```
+
+The only data change is two bytes at `0x14EE9`/`0x14EEA`. They are not a map: the code
+reaches them as elements 5 and 6 of a 7-byte array at `0x14EE4`
+(`MOVB RLx,[R4+#0x4EE4]`, R4 loaded from a RAM variable, 7 call sites around
+`0x46A98`–`0x47512`), and the patch *sets exactly four bits* (`F8→FB` = bits 0,1;
+`33→3F` = bits 2,3). That is the fingerprint of a per-fault-path bitmask edit, i.e. the four
+secondary-air DTCs (pump relay, valve, flow) are suppressed so the missing pump never sets
+the MIL. The pump output driver and the SAI control logic are untouched; the ECU still
+"runs" the SAI function, it just no longer reports it. This is the usual commercial
+"SAI off" and is adequate for a removed pump, but it is **not** a map-level deactivation.
+
+Re-creating it from the original with the tool gives a file identical to the XTuner one:
+
+```
+python3 tools/me7_tool.py patch "ECU/8N0906018AE 0001.Bin" --out /tmp/saioff.bin --at 0x14EE9 --hex "fb 3f"
+# -> md5 f0cabb1d52be19665bfbf3b26e7934af  (== XTuner file)
+```
+
+### 10.4 Plan for the final firmware
+
+Target: stage 1 + SAI off + immo off + pop-and-bang. Where each part has to be done:
+
+| Item | Where | How |
+|---|---|---|
+| Stage 1 | flash, calibration maps | buy/obtain the stage 1 file for *this* `8N0906018AE 0001` software; verify with `info` that ID strings and checksums are intact |
+| SAI off | flash, 2 bytes @`0x14EE9` | `apply-diff ORIG SAIOFF STAGE1 --out final.bin` ports the two bytes onto the stage 1 file and re-signs every checksum; conflicts (stage 1 touching the same bytes) are reported and abort |
+| Immo off | ECU **EEPROM** (95040), not flash | separate read/patch of the EEPROM with ME7EEPROM-class tools; the cluster-side consequences are in section 9 |
+| Pop & bang | flash, several maps + code conditions | not a byte patch. On ME7.5 it needs an overrun-fuel-cutoff strategy change (keep injecting on decel with retarded ignition, usually gated by rpm/throttle/temperature). This is a calibration job with the map definitions (A2L/XDF for `8N0906018AE`), not something to derive from these three files. Ask the tuning house for it on top of stage 1, or do it with a proper definition file; the tool's `maps`/`map` commands help locate candidate tables but do not name them |
+
+Whatever the combination, run `checksums` on the final file before flashing and keep the
+original read untouched.
+
+---
+
+## 11. Flash Tooling (`tools/me7_tool.py`)
+
+Dependency-free Python 3.8+. All addresses are file offsets, hex accepted (`0x14EE9`).
+
+```bash
+# identify the image and summarise all checksums
+python3 tools/me7_tool.py info "ECU/8N0906018AE 0001.Bin"
+
+# every checksum with ranges, stored vs. computed values; non-zero exit on any error
+python3 tools/me7_tool.py checksums FILE
+# correct them (never overwrites the input unless --in-place)
+python3 tools/me7_tool.py fix FILE --out fixed.bin
+
+# annotated diff: each run is labelled 'calibration' / 'program code' / 'checksum: <which>';
+# --xref adds the code locations that read changed calibration bytes
+python3 tools/me7_tool.py diff ORIG MOD --xref
+
+# port the data changes BASE->MOD onto TARGET (checksum runs skipped, sums rebuilt)
+python3 tools/me7_tool.py apply-diff ORIG SAIOFF STAGE1 --out final.bin
+
+# raw patch with automatic checksum correction
+python3 tools/me7_tool.py patch ORIG --out out.bin --at 0x14EE9 --hex "fb 3f"
+
+# what covers an offset: region, DPP address, checksums that include it
+python3 tools/me7_tool.py where FILE 0x14EE9
+# region / checksum map, including the calibration windows without CRC32 cover
+python3 tools/me7_tool.py regions FILE [--all]
+
+# code references to calibration bytes (C167 mem / indexed / pointer operands)
+python3 tools/me7_tool.py xref FILE 0x14ED0 --end 0x14EEA --quiet
+
+# tables, derived from the lookup-routine call sites (R12/R13 pointers before CALLS)
+python3 tools/me7_tool.py maps FILE --min-cells 96          # list
+python3 tools/me7_tool.py maps FILE --routines              # which lookup routines exist
+python3 tools/me7_tool.py map  FILE 0x14EEB                 # print one (axes auto-resolved)
+python3 tools/me7_tool.py map  FILE 0x15DD4 --axes 0x14450 --signed --factor 0.75
+
+python3 tools/me7_tool.py hexdump FILE --start 0x14EC0 --end 0x14F00
+python3 tools/me7_tool.py strings FILE --min 8
+
+# regression tests (checksum values, XTuner reproduction, ME7Sum-equivalent fixes)
+python3 -m unittest tools/test_me7_tool.py -v
+```
+
+Table detection notes: ME7 lookup routines receive the data pointer in R12 and, for
+"group-axis" maps, the shared `[nx][x…][ny][y…]` axes block in R13; small 2-D maps are
+"embedded" (`[nx][ny][x…][y…][data]`). The `maps` command reconstructs tables from those call
+sites, so it only lists what the code actually uses; cell width (8/16 bit) of group-axis maps
+is inferred from the data and can be overridden with `--word`. Axis/cell scaling factors are
+not known without a definition file – values are printed raw unless `--factor/--offset/--xf/--yf`
+are given.
