@@ -179,5 +179,90 @@ class Maps(unittest.TestCase):
         self.assertIn("map8 data@0x14F09 nx=14 ny=14", out)
 
 
+XDF = ROOT / "ECU" / "Profiles" / "8N0906018AE.xdf"
+
+
+class XdfEquations(unittest.TestCase):
+    def test_linear_forms(self):
+        self.assertEqual(T.xdf_linear("5.000000 * X+ -50.000000"), (5.0, -50.0))
+        self.assertEqual(T.xdf_linear("X"), (1.0, 0.0))
+        self.assertEqual(T.xdf_linear("40.000000 * X"), (40.0, 0.0))
+        self.assertIsNone(T.xdf_linear("X * X"))
+
+    def test_synthetic_definition(self):
+        xml = (
+            '<XDFFORMAT version="1.60"><XDFHEADER></XDFHEADER>\n'
+            '<XDFCONSTANT uniqueid="0x0"><title>TST1</title><description>scalar</description>'
+            '<EMBEDDEDDATA mmedaddress="0x10" mmedelementsizebits="8" />'
+            '<units>Grad C</units><MATH equation="5.000000 * X+ -50.000000"><VAR id="X" /></MATH></XDFCONSTANT>\n'
+            '<XDFTABLE uniqueid="0x0"><title>TST2</title><description>table</description>'
+            '<XDFAXIS id="x"><EMBEDDEDDATA mmedaddress="0x20" mmedelementsizebits="8" />'
+            '<units>Upm</units><MATH equation="40.000000 * X"><VAR id="X" /></MATH></XDFAXIS>'
+            '<XDFAXIS id="z"><EMBEDDEDDATA mmedaddress="0x30" mmedelementsizebits="8" mmedrowcount="1" mmedcolcount="2" />'
+            '<units>s</units><MATH equation="0.01 * X"><VAR id="X" /></MATH></XDFAXIS></XDFTABLE>\n'
+            '</XDFFORMAT>\n'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.xdf"
+            p.write_text(xml, encoding="latin-1")
+            by = T.xdf_by_title(T.load_xdf(str(p)))
+        self.assertEqual(by["TST1"].address, 0x10)
+        self.assertEqual((by["TST1"].factor, by["TST1"].offset), (5.0, -50.0))
+        t2 = by["TST2"]
+        self.assertEqual((t2.address, t2.rows, t2.cols), (0x30, 1, 2))
+        self.assertEqual(t2.x.address, 0x20)
+
+
+@unittest.skipUnless(ORIG.exists() and SAIOFF.exists() and XDF.exists(), "ECU images or XDF missing")
+class OverrunSettings(unittest.TestCase):
+    def setUp(self):
+        self.tables = T.load_xdf(str(XDF))
+        self.by = T.xdf_by_title(self.tables)
+
+    def test_overrun_tables_located(self):
+        self.assertEqual(self.by["TKATSA"].address, 0x15450)
+        self.assertEqual(self.by["DNSLL"].address, 0x1544B)
+        self.assertEqual(self.by["KFTVSA"].address, 0x19465)
+        self.assertEqual((self.by["KFTVSA"].rows, self.by["KFTVSA"].cols), (5, 8))
+        self.assertEqual(self.by["RLMNSAN"].address, 0x186F2)
+
+    def test_sai_state(self):
+        self.assertEqual(T.sai_state(T.Image.load(str(ORIG))), "stock")
+        self.assertTrue(T.sai_state(T.Image.load(str(SAIOFF))).startswith("SAI-off patch"))
+
+    def test_sai_patch_leaves_overrun_settings_alone(self):
+        a = T.Image.load(str(ORIG))
+        b = T.Image.load(str(SAIOFF))
+        for name in ("TKATSA", "DNSLL", "DNVSA", "NLRSHB", "KFTVSA", "RLMNSAN"):
+            t = self.by[name]
+            n = t.rows * t.cols * max(1, t.bits // 8)
+            self.assertEqual(a.data[t.address:t.address + n], b.data[t.address:t.address + n], name)
+
+    def test_info_prints_settings(self):
+        rc, out = run("info", ORIG, "--xdf", XDF)
+        self.assertEqual(rc, 0)
+        self.assertIn("sai state : stock", out)
+        self.assertIn("NLRSHB   @0x15CAC = 3520 rpm", out)
+        self.assertIn("Overrun cut-off lock time after end of start", out)
+        self.assertNotIn("Sperrzeit", out)
+        self.assertIn("RLMNSAN  @0x186F2", out)
+
+    def test_every_listed_setting_has_english_label(self):
+        labels, units = T.load_labels_en()
+        for title in T.SETTINGS_OVERRUN:
+            self.assertIn(title, labels, title)
+            self.assertNotIn("ß", labels[title])
+
+    def test_info_no_settings(self):
+        rc, out = run("info", ORIG, "--no-settings")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("sai state", out)
+
+    def test_info_finds_definition_in_profiles(self):
+        rc, out = run("info", ORIG)
+        self.assertIn("definition:", out)
+        self.assertNotIn("does not match", out)
+
+
 if __name__ == "__main__":
     unittest.main()

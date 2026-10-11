@@ -626,7 +626,8 @@ original read untouched.
 Dependency-free Python 3.8+. All addresses are file offsets, hex accepted (`0x14EE9`).
 
 ```bash
-# identify the image and summarise all checksums
+# identify the image, summarise all checksums, and print the current overrun/SAI settings
+# (values come from ECU/Profiles/<part>.xdf; --xdf PATH to choose another, --no-settings to skip)
 python3 tools/me7_tool.py info "ECU/8N0906018AE 0001.Bin"
 
 # every checksum with ranges, stored vs. computed values; non-zero exit on any error

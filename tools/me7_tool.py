@@ -18,7 +18,8 @@ Layout (512 KB VAG ME7.5)
   0x20000-0x7FFFF  program code; main-program checksum pair @0x7FFE0
 
 Sub-commands
-  info        ID strings, DPP setup, checksum summary
+  info        ID strings, DPP setup, checksum summary, and current overrun/SAI
+              settings read from the XDF in ECU/Profiles (--xdf, --no-xdf, --no-settings)
   checksums   verify every checksum (ROMSYS, CRC32 zones, background,
               main program, multipoint); --fix writes a corrected copy
   fix         shorthand for `checksums --fix`
@@ -849,20 +850,310 @@ def print_map(img: Image, c: MapCandidate, signed: bool, factor: float, offset: 
 
 
 # --------------------------------------------------------------------------
+# XDF definitions (TunerPro) - optional, used to name and scale tables
+# --------------------------------------------------------------------------
+
+RE_XDF_TABLE = re.compile(r"<XDFTABLE\b[^>]*>(.*?)</XDFTABLE>", re.S)
+RE_XDF_AXIS = re.compile(r"<XDFAXIS\b([^>]*)>(.*?)</XDFAXIS>", re.S)
+RE_XDF_EMB = re.compile(r"<EMBEDDEDDATA([^>]*?)/?>")
+RE_XDF_ATTR = re.compile(r'(\w+)="([^"]*)"')
+RE_XDF_MATH = re.compile(r'<MATH\s+equation="([^"]*)"')
+RE_LINEAR = re.compile(r"^(?:(?P<a>-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\*)?X(?:\+(?P<b>-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?))?$")
+
+
+@dataclass
+class XdfAxis:
+    address: Optional[int]
+    count: int
+    bits: int
+    rows: int
+    cols: int
+    factor: float
+    offset: float
+    units: str
+    labels: List[str] = field(default_factory=list)
+
+
+@dataclass
+class XdfTable:
+    title: str
+    description: str
+    category: str
+    address: int
+    rows: int
+    cols: int
+    bits: int
+    signed: bool
+    factor: float
+    offset: float
+    units: str
+    x: Optional[XdfAxis] = None
+    y: Optional[XdfAxis] = None
+    raw_equation: str = ""
+
+
+def _xdf_text(s: str, tag: str) -> str:
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", s, re.S)
+    if not m:
+        return ""
+    return re.sub(r"&#(\d+);", lambda k: chr(int(k.group(1))), m.group(1)).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").strip()
+
+
+def _xdf_int(s: str) -> int:
+    return int(s, 0)
+
+
+def xdf_linear(equation: str) -> Optional[Tuple[float, float]]:
+    """Parse 'a*X+b' style TunerPro equations into (factor, offset); None if not linear."""
+    eq = re.sub(r"\s+", "", equation or "X")
+    m = RE_LINEAR.match(eq)
+    if not m:
+        return None
+    return float(m.group("a") or 1.0), float(m.group("b") or 0.0)
+
+
+def _xdf_axis_from_block(attrs: str, body: str) -> Optional[XdfAxis]:
+    emb = RE_XDF_EMB.search(body)
+    ea = dict(RE_XDF_ATTR.findall(emb.group(1))) if emb else {}
+    addr = _xdf_int(ea["mmedaddress"]) if "mmedaddress" in ea else None
+    eq = RE_XDF_MATH.search(body)
+    lin = xdf_linear(eq.group(1)) if eq else (1.0, 0.0)
+    if lin is None:
+        lin = (1.0, 0.0)
+    count_m = re.search(r"<indexcount>(\d+)</indexcount>", body)
+    labels = re.findall(r'<LABEL index="\d+" value="([^"]*)"', body)
+    rows = _xdf_int(ea["mmedrowcount"]) if "mmedrowcount" in ea else 1
+    cols = _xdf_int(ea["mmedcolcount"]) if "mmedcolcount" in ea else 1
+    count = int(count_m.group(1)) if count_m else rows * cols
+    return XdfAxis(addr, count, int(ea.get("mmedelementsizebits", "8")), rows, cols,
+                   lin[0], lin[1], _xdf_text(body, "units"), [l for l in labels if l])
+
+
+RE_XDF_CONST = re.compile(r"<XDFCONSTANT\b[^>]*>(.*?)</XDFCONSTANT>", re.S)
+
+
+def _load_xdf_constants(text: str) -> List[XdfTable]:
+    out: List[XdfTable] = []
+    for m in RE_XDF_CONST.finditer(text):
+        body = m.group(1)
+        emb = RE_XDF_EMB.search(body)
+        if not emb:
+            continue
+        ea = dict(RE_XDF_ATTR.findall(emb.group(1)))
+        if "mmedaddress" not in ea:
+            continue
+        eq = RE_XDF_MATH.search(body)
+        raw_eq = eq.group(1) if eq else "X"
+        lin = xdf_linear(raw_eq) or (1.0, 0.0)
+        out.append(XdfTable(
+            title=_xdf_text(body, "title"), description=_xdf_text(body, "description"),
+            category="", address=_xdf_int(ea["mmedaddress"]), rows=1, cols=1,
+            bits=int(ea.get("mmedelementsizebits", "8")), signed=False,
+            factor=lin[0], offset=lin[1], units=_xdf_text(body, "units"), raw_equation=raw_eq))
+    return out
+
+
+def load_xdf(path: str) -> List[XdfTable]:
+    text = Path(path).read_text(encoding="latin-1")
+    tables: List[XdfTable] = _load_xdf_constants(text)
+    for m in RE_XDF_TABLE.finditer(text):
+        body = m.group(1)
+        title = _xdf_text(body, "title")
+        desc = _xdf_text(body, "description")
+        cat_m = re.search(r'<CATEGORYMEM[^>]*category="(\d+)"', body)
+        axes = {}
+        z = None
+        for am in RE_XDF_AXIS.finditer(body):
+            aid = dict(RE_XDF_ATTR.findall(am.group(1))).get("id", "")
+            if aid == "z":
+                z = am.group(2)
+            elif aid in ("x", "y"):
+                axes[aid] = _xdf_axis_from_block(am.group(1), am.group(2))
+        if z is None:
+            continue
+        emb = RE_XDF_EMB.search(z)
+        if not emb:
+            continue
+        ea = dict(RE_XDF_ATTR.findall(emb.group(1)))
+        if "mmedaddress" not in ea:
+            continue
+        eq = RE_XDF_MATH.search(z)
+        raw_eq = eq.group(1) if eq else "X"
+        lin = xdf_linear(raw_eq) or (1.0, 0.0)
+        rows = _xdf_int(ea["mmedrowcount"]) if "mmedrowcount" in ea else 1
+        cols = _xdf_int(ea["mmedcolcount"]) if "mmedcolcount" in ea else 1
+        flags = _xdf_int(ea["mmedtypeflags"]) if "mmedtypeflags" in ea else 0
+        tables.append(XdfTable(
+            title=title, description=desc, category=cat_m.group(1) if cat_m else "",
+            address=_xdf_int(ea["mmedaddress"]), rows=rows, cols=cols,
+            bits=int(ea.get("mmedelementsizebits", "8")), signed=bool(flags & 0x01),
+            factor=lin[0], offset=lin[1], units=_xdf_text(z, "units"),
+            x=axes.get("x"), y=axes.get("y"), raw_equation=raw_eq))
+    return tables
+
+
+def find_xdf(img_path: str, part: Optional[str]) -> Optional[str]:
+    """Default definition lookup: ECU/Profiles/*.xdf next to the image; prefer the one named after the part."""
+    folder = Path(img_path).resolve().parent / "Profiles"
+    if not folder.is_dir():
+        return None
+    cands = sorted(folder.glob("*.xdf"))
+    if part:
+        for c in cands:
+            if c.stem.upper().startswith(part.upper()):
+                return str(c)
+    return str(cands[0]) if cands else None
+
+
+def xdf_by_title(tables: Sequence[XdfTable]) -> Dict[str, XdfTable]:
+    return {t.title: t for t in tables}
+
+
+def read_cells(img: Image, addr: int, n: int, bits: int, signed: bool, factor: float, offset: float) -> List[float]:
+    w = max(1, bits // 8)
+    out: List[float] = []
+    for i in range(n):
+        o = addr + i * w
+        if o + w > len(img.data):
+            break
+        v = int.from_bytes(img.data[o:o + w], "little")
+        if signed and v >= 1 << (8 * w - 1):
+            v -= 1 << (8 * w)
+        out.append(v * factor + offset)
+    return out
+
+
+# Overrun fuel cut (Schubabschaltung) and related settings. Titles are the
+# XDF table names; anything missing from the definition is reported, not guessed.
+SETTINGS_OVERRUN = [
+    "TKATSA", "TATMSA", "DNSLL", "DNVSA", "NLRSHB", "KFTVSA", "TVSATM",
+    "RLMNSAN", "REDMXSA", "TDMFBSA", "NGDNSA", "VSAA", "DVSAVO", "DVSAVU",
+]
+
+# Secondary-air (SAI) related bit array, located by address from the README
+# (0x14EE4, 7 bytes). Known patch states are matched by content, not by name.
+SAI_ARRAY_ADDR = 0x14EE4
+SAI_ARRAY_LEN = 7
+SAI_STOCK = bytes.fromhex("ffff00c0fff833")
+SAI_OFF_TAIL = bytes.fromhex("fb3f")   # elements 5-6 after the XTuner SAI-off patch
+
+
+def sai_state(img: Image) -> str:
+    cells = bytes(img.data[SAI_ARRAY_ADDR:SAI_ARRAY_ADDR + SAI_ARRAY_LEN])
+    if cells == SAI_STOCK:
+        return "stock"
+    if cells[5:7] == SAI_OFF_TAIL and cells[:5] == SAI_STOCK[:5]:
+        return "SAI-off patch applied (matches XTuner signature)"
+    return "modified/unknown"
+
+
+LABELS_EN_PATH = Path(__file__).resolve().parent / "xdf_labels_en.json"
+
+
+def load_labels_en(path: Path = LABELS_EN_PATH) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """(title -> English label, German unit -> English unit) from xdf_labels_en.json."""
+    import json
+    if not path.exists():
+        return {}, {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    labels = {k: v["en"] for k, v in data.get("labels", {}).items() if v.get("en")}
+    return labels, dict(data.get("units", {}))
+
+
+def label_en(t: XdfTable, labels: Dict[str, str]) -> str:
+    """English label for a table; falls back to the German XDF description if untranslated."""
+    return labels.get(t.title, t.description)
+
+
+def unit_en(u: str, units: Dict[str, str]) -> str:
+    return units.get(u, u)
+
+
+def print_xdf_table(img: Image, t: XdfTable, labels: Optional[Dict[str, str]] = None,
+                    units: Optional[Dict[str, str]] = None) -> None:
+    """Print a table with its XDF axes, values scaled by the XDF equation."""
+    if labels is None or units is None:
+        labels, units = load_labels_en()
+    text = label_en(t, labels)
+    u = unit_en(t.units, units)
+    n = t.rows * t.cols
+    vals = read_cells(img, t.address, n, t.bits, t.signed, t.factor, t.offset)
+    if t.x is None and t.y is None and n == 1:
+        w = max(1, t.bits // 8)
+        raw = int.from_bytes(img.data[t.address:t.address + w], "little")
+        print(f"{t.title:<8s} @{hexaddr(t.address)} = {vals[0]:g} {u}  (raw 0x{raw:0{2 * w}X})  [{text}]")
+        return
+    print(f"{t.title}  @{hexaddr(t.address)}  {t.rows}x{t.cols}  {t.bits}-bit  units={u or '-'}  [{text}]")
+    if t.rows == 1:
+        xs = _axis_values(img, t.x, t.cols) if t.x else []
+        if xs and len(xs) == len(vals):
+            print("  " + "  ".join(f"{x:>7.1f}" for x in xs))
+        print("  " + "  ".join(f"{v:>7.2f}" for v in vals))
+        return
+    xs = _axis_values(img, t.x, t.cols) if t.x else [None] * t.cols
+    ys = _axis_values(img, t.y, t.rows) if t.y else [None] * t.rows
+    head = " " * 10 + " ".join((f"{x:>7.1f}" if x is not None else f"{'col'+str(i):>7}") for i, x in enumerate(xs))
+    print(head)
+    for r in range(t.rows):
+        ylab = f"{ys[r]:>8.1f}" if ys[r] is not None else f"{'row'+str(r):>8}"
+        row = vals[r * t.cols:(r + 1) * t.cols]
+        print(f"{ylab} " + " ".join(f"{v:>7.2f}" for v in row))
+
+
+def _axis_values(img: Image, ax: Optional[XdfAxis], n: int) -> List[float]:
+    if ax is None:
+        return []
+    if ax.address is None:
+        return [float(i) for i in range(n)]
+    return read_cells(img, ax.address, min(n, ax.count), ax.bits, False, ax.factor, ax.offset)
+
+
+def print_settings(img: Image, tables: Sequence[XdfTable], listed: Sequence[str] = SETTINGS_OVERRUN) -> None:
+    by = xdf_by_title(tables)
+    labels, units = load_labels_en()
+    print(f"\nsettings  : overrun / SAI-related values (from XDF, read-only; labels in English)")
+    print(f"sai state : {sai_state(img)}")
+    print(f"            ESKONF @{hexaddr(SAI_ARRAY_ADDR)} = " + " ".join(f"{b:02x}" for b in img.data[SAI_ARRAY_ADDR:SAI_ARRAY_ADDR + SAI_ARRAY_LEN]))
+    missing = []
+    for title in listed:
+        t = by.get(title)
+        if t is None:
+            missing.append(title)
+            continue
+        print()
+        print_xdf_table(img, t, labels, units)
+    if missing:
+        print(f"\nnot in definition: {', '.join(missing)}")
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
 
 def cmd_info(a: argparse.Namespace) -> int:
     img = Image.load(a.file)
+    ids = ecu_ids(img)
     print(f"file      : {img.path}  ({len(img)} bytes, md5 {img.md5()})")
-    for k, (o, v) in ecu_ids(img).items():
+    for k, (o, v) in ids.items():
         print(f"{k:<10s}: {v!r:<40s} @{hexaddr(o)}")
     dpp = dpp_setup(img)
     print("dpp       : " + "  ".join(f"DPP{n}=0x{p:03X} (C167 0x{p << 14:06X})" for n, p in sorted(dpp.items())))
     cm = ChecksumMap(img)
     nerr = print_checks(cm, verbose=False)
     print(f"\nchecksums : {len(cm.checks)} found, {nerr} error(s)")
+    if not a.no_settings:
+        part = ids["part_number"][1] if "part_number" in ids else None
+        xdf_path = a.xdf or ("" if a.no_xdf else find_xdf(a.file, part) or "")
+        if xdf_path:
+            tables = load_xdf(xdf_path)
+            print(f"\ndefinition: {xdf_path} ({len(tables)} tables)")
+            stem = Path(xdf_path).stem.upper()
+            if part and not stem.startswith(part.upper()):
+                print(f"warning   : definition name '{Path(xdf_path).name}' does not match part {part}")
+            print_settings(img, tables)
+        else:
+            print("\nsettings  : no XDF definition found (use --xdf PATH)")
     return 1 if nerr else 0
 
 
@@ -1128,8 +1419,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("info", help="identify image and summarise checksums")
+    s = sub.add_parser("info", help="identify image, checksums and current overrun/SAI settings")
     s.add_argument("file")
+    s.add_argument("--xdf", help="TunerPro definition to name/scale tables (default: ECU/Profiles/<part>*.xdf)")
+    s.add_argument("--no-xdf", action="store_true", help="skip definition lookup")
+    s.add_argument("--no-settings", action="store_true", help="omit the settings section")
     s.set_defaults(fn=cmd_info)
 
     for name, fn in (("checksums", cmd_checksums), ("fix", cmd_fix)):

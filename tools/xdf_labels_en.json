@@ -1,0 +1,69 @@
+{
+  "_comment": "English labels for XDF titles used by me7_tool.py info. 'de' is the original XDF description, kept for reference. Abbreviations (SA, LR, LL, WE, FGR) are ME7/VAG German codes; they are kept as-is where the meaning is not certain.",
+  "units": {
+    "Upm": "rpm",
+    "U/min/s": "rpm/s",
+    "Grad C": "°C",
+    "km/h": "km/h",
+    "s": "s",
+    "%": "%"
+  },
+  "labels": {
+    "TKATSA": {
+      "en": "Catalyst temperature threshold for overrun fuel cut-off",
+      "de": "Katalysator-Temperaturschwelle für Schubabschalten"
+    },
+    "TATMSA": {
+      "en": "Exhaust gas temperature at which overrun cut-off is stopped",
+      "de": "Abgastemperatur bei Schubabschneiden"
+    },
+    "DNSLL": {
+      "en": "Overrun cut-off hysteresis (re-enable) at idle",
+      "de": "Schubabschalte-Hysterese bei WE im Leerlauf"
+    },
+    "DNVSA": {
+      "en": "Overrun cut-off rpm increase at low vehicle speed",
+      "de": "Schubabschaltedrehzahlanhebung bei kleiner Geschwindigkeit"
+    },
+    "NLRSHB": {
+      "en": "Rpm threshold for switching off LR during overrun (with LL and TLLRSHB)",
+      "de": "Drehzahlschwelle, Abschalten LR bei Schub, in Verbindung mit LL und TLLRSHB"
+    },
+    "KFTVSA": {
+      "en": "Delay before overrun fuel cut-off (map: rpm x load)",
+      "de": "Verzögerungszeit für Schubabschalten"
+    },
+    "TVSATM": {
+      "en": "Overrun cut-off lock time after end of start",
+      "de": "Sperrzeit Schubabschalten nach Startende"
+    },
+    "RLMNSAN": {
+      "en": "Minimum air fill during overrun (characteristic curve)",
+      "de": "Kennlinie minimale Füllung im Schub"
+    },
+    "REDMXSA": {
+      "en": "Maximum reduction stage for sequential overrun cut-off",
+      "de": "maximale Reduzierstufe bei sequentieller Schubabschaltung"
+    },
+    "TDMFBSA": {
+      "en": "PT1 filter time constant during overrun cut-off",
+      "de": "Zeitkonstante PT1-Filter beim Schubabschalten"
+    },
+    "NGDNSA": {
+      "en": "Rpm gradient when ramping down the overrun cut-off hysteresis",
+      "de": "Drehzahlgradient beim Absteuern der Schubabschalthysterese"
+    },
+    "VSAA": {
+      "en": "Vehicle speed threshold for overrun rpm increase",
+      "de": "Geschwindigkeitsschwelle für SA-Drehzahlanhebung"
+    },
+    "DVSAVO": {
+      "en": "Speed delta to reset overrun-cut inhibit from cruise control (FGR)",
+      "de": "Delta Geschwindigkeit für Rücksetzen Schubabschalteverbot vom FGR"
+    },
+    "DVSAVU": {
+      "en": "Speed delta to set overrun-cut inhibit from cruise control (FGR)",
+      "de": "Delta Geschwindigkeit für Setzen Schubabschalteverbot vom FGR"
+    }
+  }
+}
